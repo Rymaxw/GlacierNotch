@@ -1,8 +1,7 @@
 /target
-/tests/clip_probe/target/
+tests/
 **/__pycache__/
 *.pyc
-/tests/resume-results.json
 /CHECKPOINT.md
 /QA.md
 /GATES.md
