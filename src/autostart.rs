@@ -12,7 +12,7 @@ pub fn entry_path() -> PathBuf {
 }
 
 fn desktop_entry() -> &'static str {
-    include_str!("../packaging/glaciernotch.desktop")
+    include_str!("../packaging/glaciernotch-autostart.desktop")
 }
 
 pub fn status() -> bool {

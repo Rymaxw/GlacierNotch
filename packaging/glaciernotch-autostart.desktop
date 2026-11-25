@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=GlacierNotch
+Comment=Music and focus notch for XFCE
+Exec=systemctl --user start glaciernotch.service
+Icon=glaciernotch
+Terminal=false
+Categories=AudioVideo;Audio;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

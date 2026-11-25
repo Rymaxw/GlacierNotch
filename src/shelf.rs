@@ -21,12 +21,50 @@ pub enum Action {
     Clear,
 }
 
-#[derive(Default)]
 pub struct Shelf {
     pub items: Vec<Item>,
+    max_items: usize,
+    persist: bool,
+    path: PathBuf,
+}
+
+impl Default for Shelf {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            max_items: MAX_ITEMS,
+            persist: false,
+            path: glacier::storage::data_path("shelf.json"),
+        }
+    }
 }
 
 impl Shelf {
+    pub fn configure(&mut self, max_items: usize, persist: bool) {
+        let enabling_persist = !self.persist && persist;
+        self.max_items = max_items.clamp(1, 32);
+        self.persist = persist;
+        if enabling_persist
+            && self.items.is_empty()
+            && let Ok(paths) = glacier::storage::read_at::<PathBuf>(&self.path)
+        {
+            for path in paths.into_iter().rev() {
+                if let Some(item) = describe(path) {
+                    self.items.insert(0, item);
+                }
+            }
+        }
+        self.items.truncate(self.max_items);
+        if self.persist {
+            self.save();
+        }
+    }
+
+    fn save(&self) {
+        let paths: Vec<&PathBuf> = self.items.iter().map(|item| &item.path).collect();
+        let _ = glacier::storage::write_at(&self.path, &paths);
+    }
+
     pub fn add(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         for path in paths {
             let Some(item) = describe(path) else {
@@ -37,7 +75,10 @@ impl Shelf {
             }
             self.items.insert(0, item);
         }
-        self.items.truncate(MAX_ITEMS);
+        self.items.truncate(self.max_items);
+        if self.persist {
+            self.save();
+        }
     }
 
     /// Returns a path string when the action was `Copy`, so the caller can hand
@@ -60,6 +101,9 @@ impl Shelf {
                 .map(|item| item.path.display().to_string()),
             Action::Clear => {
                 self.items.clear();
+                if self.persist {
+                    self.save();
+                }
                 None
             }
         }

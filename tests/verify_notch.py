@@ -33,7 +33,8 @@ SCREEN_W = 1280
 PANEL_X = (SCREEN_W - W_EXPANDED) // 2
 PILL_X = PANEL_X + (W_EXPANDED - W_COLLAPSED) // 2
 BG = (9, 9, 12)
-TAB_SLOT = W_EXPANDED / 5.0
+GEAR_W = 28.0
+TAB_SLOT = (W_EXPANDED - GEAR_W) / 5.0
 
 
 def until(check, timeout=12):
@@ -69,7 +70,7 @@ def screenshot(env, path):
 def assert_pill(img, state):
     """Painted pixels are exactly BG; anything clipped shows the backdrop."""
     for x in range(PILL_X + 8, PILL_X + W_COLLAPSED - 8, 6):
-        pixel = img.getpixel((x, 5))
+        pixel = img.getpixel((x, 1))
         assert pixel == BG, f"{state}: notch cut at x={x}, pixel={pixel}"
     for x in (PILL_X - 5, PILL_X + W_COLLAPSED + 4):
         assert img.getpixel((x, 5)) != BG, f"{state}: pill overdraw at x={x}"
@@ -175,7 +176,12 @@ def main():
         shots = Path(os.environ.get("GLACIER_QA_SHOTS", temp))
         shots.mkdir(parents=True, exist_ok=True)
         # :97 is reserved for tests, never Max's real DISPLAY=:0.
-        env = {**os.environ, "DISPLAY": ":97", "XDG_DATA_HOME": str(base / "data")}
+        env = {
+            **os.environ,
+            "DISPLAY": ":97",
+            "XDG_DATA_HOME": str(base / "data"),
+            "XDG_CONFIG_HOME": str(base / "config"),
+        }
         assert not Path("/tmp/.X97-lock").exists(), "test display :97 already in use"
         stub_log = base / "stub.log"
         if mode in {"collapsed", "interaction", "tabs", "media", "controls", "focus", "clips", "notes", "shelf", "keyboard"}:
@@ -256,14 +262,20 @@ def main():
             assert_pill(collapsed_image, "collapsed")
             if mode == "collapsed":
                 frames = record_mascot(env, shots / "mascot-idle.gif")
-                aura = (80, 6, 103, 28)
-                assert max(color_count(frame, aura, gold) for frame in frames) >= 6, "aura does not extend past the hair"
+                aura = (72, 6, 105, 30)
+                assert max(color_count(frame, aura, gold) for frame in frames) >= 6, "golden kunai spark / bokeh aura missing"
                 assert len({frame.crop(aura).tobytes() for frame in frames}) >= 3, "idle aura stayed static"
-                for side in (-10, 10):
-                    eye = (55 + side - 5, 14, 55 + side + 5, 28)
-                    counts = [color_count(frame, eye, lambda r, g, b: b > 170 and b > r * 1.35) for frame in frames]
-                    assert max(counts) >= 25, "blue eye missing"
-                    assert min(counts) < max(counts) // 2, "eye did not blink"
+                hair = (30, 1, 80, 12)
+                assert color_count(frames[0], hair, lambda r, g, b: r > 200 and g > 150 and b < 170) >= 60, "blazing golden KCM hair missing"
+                face = (44, 11, 66, 26)
+                assert color_count(frames[0], face, lambda r, g, b: r > 210 and g > 165 and b < 150) >= 40, "radiant golden KCM face missing"
+                collar = (40, 22, 70, 31)
+                assert color_count(frames[0], collar, lambda r, g, b: r > 180 and g > 100 and b < 95) >= 12, "golden KCM collar missing"
+                assert color_count(frames[0], collar, lambda r, g, b: r < 70 and g < 60 and b < 55) >= 8, "black Kurama tomoe collar markings missing"
+                for eye in ((45, 14, 53, 21), (57, 14, 65, 21)):
+                    counts = [color_count(frame, eye, lambda r, g, b: r > 165 and r > g * 1.65 and b < 85) for frame in frames]
+                    assert max(counts) >= 4, f"fiery Kurama fox eye missing: {max(counts)}"
+                    assert min(counts) < max(counts) // 2, f"Kurama eye did not blink: {min(counts)}..{max(counts)}"
                 print("G1_NOTCH_VISIBLE")
                 return
             if mode == "media":
@@ -288,23 +300,38 @@ def main():
 
             if mode == "notes":
                 store = base / "data/glacier/notes.json"
+                backdrop_wid = move(120, 320)
+                assert backdrop_wid != wid and backdrop_wid > 1, f"expected backdrop window, got {backdrop_wid}"
+                input_driver.focus(backdrop_wid)
+                assert input_driver.get_focus() == backdrop_wid
+                move(PILL_X + W_COLLAPSED // 2, 15)
+                time.sleep(0.5)
                 click(PANEL_X + int(TAB_SLOT * 4.5), 13)
                 click(PANEL_X + 126, 46)                       # Notes view
+                assert input_driver.get_focus() == backdrop_wid, "opening Notes list stole keyboard focus"
                 click(PANEL_X + W_EXPANDED - 55, 46)         # New note
-                input_driver.focus(wid)
+                until(lambda: input_driver.get_focus() == wid)
                 click(PANEL_X + W_EXPANDED - 137, 214)       # Empty save keeps the editor
                 assert not store.exists(), "An empty note was persisted"
                 screenshot(env, shots / "notes-validation.png")
                 click(PANEL_X + 110, 126)
-                input_driver.type_text("first quick note")
+                input_driver.type_text("first quik")
+                input_driver.key("BackSpace", settle=0.05)
+                input_driver.type_text("ck note\nline two")
+                input_driver.key("Left", settle=0.05)
+                input_driver.key("Left", settle=0.05)
+                input_driver.key("Left", settle=0.05)
+                input_driver.type_text("number ")
                 click(PANEL_X + W_EXPANDED - 137, 214)       # Save
-                until(lambda: store.exists() and json.loads(store.read_text())[0]["text"] == "first quick note")
+                until(lambda: store.exists() and json.loads(store.read_text())[0]["text"] == "first quick note\nline number two")
+                until(lambda: input_driver.get_focus() == backdrop_wid)
 
                 input_driver.focus(wid)
                 input_driver.key("Escape")
                 app.wait(timeout=5)
                 app = subprocess.Popen([str(BIN), "--demo"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 wid = until(lambda: geometry(env))[0]
+                input_driver.focus(backdrop_wid)
                 move(PILL_X + W_COLLAPSED // 2, 15)
                 time.sleep(0.6)
                 click(PANEL_X + int(TAB_SLOT * 4.5), 13)
@@ -314,14 +341,25 @@ def main():
                 time.sleep(0.6)
                 got = subprocess.run([str(ROOT / "target/probe/release/clip-probe"), "get"], env=env, capture_output=True, text=True)
                 assert got.returncode == 0, got.stderr
-                assert got.stdout.strip() == "first quick note", got.stdout
+                assert got.stdout.strip() == "first quick note\nline number two", got.stdout
                 click(PANEL_X + W_EXPANDED - 59, 83)         # Edit row 0
-                input_driver.focus(wid)
+                until(lambda: input_driver.get_focus() == wid)
+                # Switching to another window leaves the draft open without stealing focus back.
+                input_driver.focus(backdrop_wid)
+                time.sleep(0.3)
+                assert input_driver.get_focus() == backdrop_wid, "notch stole focus back while user was in another window"
+                # Clicking back into the Notes editor re-acquires keyboard focus.
                 click(PANEL_X + 110, 126)
+                until(lambda: input_driver.get_focus() == wid)
                 input_driver.key("a", ("Control_L",))
                 input_driver.type_text("edited quick note")
+                input_driver.key("a", ("Control_L",))
+                input_driver.key("c", ("Control_L",))
+                input_driver.key("BackSpace", settle=0.05)
+                input_driver.key("v", ("Control_L",))
                 click(PANEL_X + W_EXPANDED - 137, 214)
                 until(lambda: json.loads(store.read_text())[0]["text"] == "edited quick note")
+                until(lambda: input_driver.get_focus() == backdrop_wid)
                 click(PANEL_X + W_EXPANDED - 22, 83)         # Remove
                 until(lambda: json.loads(store.read_text()) == [])
 
@@ -333,6 +371,7 @@ def main():
                 store.write_text(json.dumps(fixtures))
                 app = subprocess.Popen([str(BIN), "--demo"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 wid = until(lambda: geometry(env))[0]
+                input_driver.focus(backdrop_wid)
                 move(PILL_X + W_COLLAPSED // 2, 15)
                 time.sleep(0.6)
                 click(PANEL_X + int(TAB_SLOT * 4.5), 13)
@@ -348,11 +387,12 @@ def main():
                 got = subprocess.run([str(ROOT / "target/probe/release/clip-probe"), "get"], env=env, capture_output=True, text=True)
                 assert got.returncode == 0 and got.stdout.strip() == fixtures[0]["text"], "Removing the last item left Notes on an empty page"
                 click(PANEL_X + W_EXPANDED - 55, 46)
-                input_driver.focus(wid)
+                until(lambda: input_driver.get_focus() == wid)
                 click(PANEL_X + 110, 126)
                 input_driver.type_text("discarded note 12345")
                 input_driver.key("Escape")
                 assert app.poll() is None, "Escape in the editor quit the app"
+                until(lambda: input_driver.get_focus() == backdrop_wid)
                 assert len(json.loads(store.read_text())) == 5, "Cancel saved an unwanted note"
                 click(PANEL_X + W_EXPANDED - 109, 83)
                 got = subprocess.run([str(ROOT / "target/probe/release/clip-probe"), "get"], env=env, capture_output=True, text=True)

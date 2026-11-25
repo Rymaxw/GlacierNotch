@@ -21,6 +21,10 @@ pub struct Controls {
     /// `wpctl` is preferred; `pactl` covers boxes that only ship PulseAudio.
     backend: Backend,
     output: Option<String>,
+    volume_enabled: bool,
+    brightness_enabled: bool,
+    volume_max: f32,
+    brightness_min: f32,
     last_volume: Instant,
     last_brightness: Instant,
     last_refresh: Instant,
@@ -59,6 +63,10 @@ impl Controls {
             muted: false,
             backend,
             output: detect_output(),
+            volume_enabled: true,
+            brightness_enabled: true,
+            volume_max: VOLUME_MAX,
+            brightness_min: BRIGHTNESS_MIN,
             last_volume: Instant::now() - Duration::from_secs(1),
             last_brightness: Instant::now() - Duration::from_secs(1),
             last_refresh: Instant::now() - Duration::from_secs(5),
@@ -68,15 +76,39 @@ impl Controls {
     }
 
     pub fn has_volume(&self) -> bool {
-        self.backend != Backend::None
+        self.volume_enabled && self.backend != Backend::None
     }
 
     pub fn has_brightness(&self) -> bool {
-        self.output.is_some()
+        self.brightness_enabled && self.output.is_some()
+    }
+
+    pub fn volume_max(&self) -> f32 {
+        self.volume_max
+    }
+
+    pub fn apply_config(
+        &mut self,
+        volume_enabled: bool,
+        brightness_enabled: bool,
+        volume_max: f32,
+        brightness_min: f32,
+        preferred_output: Option<&str>,
+    ) {
+        if self.brightness_enabled && !brightness_enabled {
+            self.restore_brightness();
+        }
+        self.volume_enabled = volume_enabled;
+        self.brightness_enabled = brightness_enabled;
+        self.volume_max = volume_max.clamp(0.5, 1.5);
+        self.brightness_min = brightness_min.clamp(0.10, 0.80);
+        self.volume = self.volume.clamp(0.0, self.volume_max);
+        self.brightness = self.brightness.clamp(self.brightness_min, 1.0);
+        self.output = resolve_output(preferred_output);
     }
 
     pub fn refresh(&mut self) {
-        if self.last_refresh.elapsed() < REFRESH_EVERY {
+        if !self.volume_enabled || self.last_refresh.elapsed() < REFRESH_EVERY {
             return;
         }
         self.last_refresh = Instant::now();
@@ -84,7 +116,7 @@ impl Controls {
             return;
         };
         if let Some((volume, muted)) = parse_volume(&raw) {
-            self.volume = volume.clamp(0.0, VOLUME_MAX);
+            self.volume = volume.clamp(0.0, self.volume_max);
             self.muted = muted;
         }
     }
@@ -107,7 +139,10 @@ impl Controls {
     /// `force` bypasses the rate limit so the value the pointer was released on
     /// is always the value the sink ends up with.
     pub fn set_volume(&mut self, value: f32, force: bool) {
-        let value = value.clamp(0.0, VOLUME_MAX);
+        if !self.volume_enabled {
+            return;
+        }
+        let value = value.clamp(0.0, self.volume_max);
         self.volume = value;
         if !force && self.last_volume.elapsed() < APPLY_EVERY {
             return;
@@ -135,7 +170,10 @@ impl Controls {
     }
 
     pub fn set_brightness(&mut self, value: f32, force: bool) {
-        let value = value.clamp(BRIGHTNESS_MIN, 1.0);
+        if !self.brightness_enabled {
+            return;
+        }
+        let value = value.clamp(self.brightness_min, 1.0);
         self.brightness = value;
         if !force && self.last_brightness.elapsed() < APPLY_EVERY {
             return;
@@ -154,23 +192,69 @@ impl Controls {
 
     /// Put the gamma ramp back so quitting does not leave the screen dimmed.
     pub fn restore_brightness(&mut self) {
-        self.set_brightness(1.0, true);
+        self.brightness = 1.0;
+        let Some(output) = self.output.as_deref() else {
+            return;
+        };
+        let _ = Command::new("xrandr")
+            .args(["--output", output, "--gamma", "1.000:1.000:1.000"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
-/// First connected output that is not a virtual/offscreen one.
-fn detect_output() -> Option<String> {
-    let output = Command::new("xrandr").arg("--query").output().ok()?;
+pub fn detected_audio_backend_label() -> &'static str {
+    if which("wpctl") {
+        "PipeWire (wpctl)"
+    } else if which("pactl") {
+        "PulseAudio (pactl)"
+    } else {
+        "Not detected"
+    }
+}
+
+pub fn list_outputs() -> Vec<String> {
+    let Ok(output) = Command::new("xrandr").arg("--query").output() else {
+        return Vec::new();
+    };
     let text = String::from_utf8_lossy(&output.stdout);
+    let mut outputs = Vec::new();
     for line in text.lines() {
         if let Some((name, rest)) = line.split_once(' ')
             && rest.trim_start().starts_with("connected")
             && !name.contains("VIRTUAL")
         {
-            return Some(name.to_owned());
+            outputs.push(name.to_owned());
         }
     }
-    None
+    outputs
+}
+
+pub fn reset_gamma(preferred_output: Option<&str>) {
+    let Some(output) = resolve_output(preferred_output) else {
+        return;
+    };
+    let _ = Command::new("xrandr")
+        .args(["--output", &output, "--gamma", "1.000:1.000:1.000"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn resolve_output(preferred: Option<&str>) -> Option<String> {
+    let outputs = list_outputs();
+    if let Some(wanted) = preferred.map(str::trim).filter(|s| !s.is_empty())
+        && outputs.iter().any(|name| name == wanted)
+    {
+        return Some(wanted.to_owned());
+    }
+    outputs.into_iter().next()
+}
+
+/// First connected output that is not a virtual/offscreen one.
+fn detect_output() -> Option<String> {
+    list_outputs().into_iter().next()
 }
 
 /// `Volume: 1.06` or `Volume: 0.45 [MUTED]`.
@@ -211,6 +295,10 @@ mod tests {
             muted: false,
             backend: Backend::None,
             output: None,
+            volume_enabled: true,
+            brightness_enabled: true,
+            volume_max: VOLUME_MAX,
+            brightness_min: BRIGHTNESS_MIN,
             last_volume: Instant::now(),
             last_brightness: Instant::now(),
             last_refresh: Instant::now(),

@@ -12,6 +12,7 @@ pub enum Mode {
 }
 
 impl Mode {
+    #[allow(dead_code)]
     pub fn seconds(self) -> u32 {
         match self {
             Mode::Focus => FOCUS_SECS,
@@ -19,6 +20,7 @@ impl Mode {
         }
     }
 
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             Mode::Focus => "Focus 25m",
@@ -47,6 +49,10 @@ pub struct Timer {
     running: bool,
     /// Sessions finished since launch, shown as small dots.
     completed: u32,
+    focus_secs: u32,
+    break_secs: u32,
+    notifications: bool,
+    auto_start_next: bool,
 }
 
 impl Default for Timer {
@@ -56,27 +62,63 @@ impl Default for Timer {
             remaining: FOCUS_SECS as f64,
             running: false,
             completed: 0,
+            focus_secs: FOCUS_SECS,
+            break_secs: BREAK_SECS,
+            notifications: true,
+            auto_start_next: false,
         }
     }
 }
 
 impl Timer {
+    pub fn apply_config(
+        &mut self,
+        focus_minutes: u32,
+        break_minutes: u32,
+        notifications: bool,
+        auto_start_next: bool,
+    ) {
+        let old_total = self.mode_seconds(self.mode) as f64;
+        let at_full = !self.running && (self.remaining - old_total).abs() < 0.5;
+        self.focus_secs = focus_minutes.clamp(1, 180) * 60;
+        self.break_secs = break_minutes.clamp(1, 60) * 60;
+        self.notifications = notifications;
+        self.auto_start_next = auto_start_next;
+        if at_full {
+            self.remaining = self.mode_seconds(self.mode) as f64;
+        }
+    }
+
+    pub fn mode_seconds(&self, mode: Mode) -> u32 {
+        match mode {
+            Mode::Focus => self.focus_secs,
+            Mode::Break => self.break_secs,
+        }
+    }
+
+    pub fn mode_label(&self, mode: Mode) -> String {
+        match mode {
+            Mode::Focus => format!("Focus {}m", self.focus_secs / 60),
+            Mode::Break => format!("Break {}m", self.break_secs / 60),
+        }
+    }
+
     pub fn act(&mut self, action: Action) {
         match action {
             Action::Toggle => {
                 if self.remaining <= 0.5 {
-                    self.remaining = self.mode.seconds() as f64;
+                    self.remaining = self.mode_seconds(self.mode) as f64;
                 }
                 self.running = !self.running;
             }
             Action::Reset => {
                 self.running = false;
-                self.remaining = self.mode.seconds() as f64;
+                self.remaining = self.mode_seconds(self.mode) as f64;
             }
             Action::Set(mode) => {
                 self.mode = mode;
                 self.running = false;
-                self.remaining = mode.seconds() as f64;
+                self.remaining = self.mode_seconds(mode) as f64;
             }
         }
     }
@@ -92,13 +134,16 @@ impl Timer {
         }
         let finished = self.mode;
         self.completed += 1;
-        self.running = false;
+        self.running = self.auto_start_next;
         self.mode = finished.other();
-        self.remaining = self.mode.seconds() as f64;
-        notify(match finished {
-            Mode::Focus => "Focus session done. Take 5 minutes.",
-            Mode::Break => "Break over. Back to focus.",
-        });
+        self.remaining = self.mode_seconds(self.mode) as f64;
+        if self.notifications {
+            let break_mins = self.break_secs / 60;
+            notify(&match finished {
+                Mode::Focus => format!("Focus session done. Take {break_mins} minutes."),
+                Mode::Break => "Break over. Back to focus.".to_owned(),
+            });
+        }
         Some(finished)
     }
 
@@ -119,7 +164,7 @@ impl Timer {
     }
 
     pub fn progress(&self) -> f32 {
-        let total = self.mode.seconds() as f64;
+        let total = self.mode_seconds(self.mode) as f64;
         if total <= 0.0 {
             return 0.0;
         }

@@ -6,20 +6,21 @@ A small Linux/X11 notch-like music overlay. Built in Rust with eframe/egui and M
 
 - Top-center notch above the XFCE panel. The X11 window stays at a fixed size; only the painted panel animates on hover. The input shape passes clicks through the transparent area when collapsed.
 - Expanded media panel: MPRIS album artwork when the player supplies a readable local `mpris:artUrl`, track, artist, album, progress and centered previous / play-pause / next controls. Remote artwork URLs are not fetched; unavailable art uses a title initial on a track-specific color tile.
-- Collapsed state: the idle mascot is just animated hair, blinking eyes, and a gold aura; the notch itself is the face. A playing or paused track replaces it with the cover (or title initial) and title.
+- Collapsed state: the idle mascot is a cute floating flat-vector Kurama Chakra Mode (KCM) Minato Namikaze head emblem (blazing golden-yellow spiky hair with flickering chakra flame wisps and long bangs, black-and-gold Konoha headband, radiant golden chakra face with blinking crimson-orange vertical fox-slit eyes, snug golden Hokage cloak collar with jet-black Kurama tomoe markings floating under the chin, supercharged Flying Raijin kunai with golden starburst spark, warm chakra embers, and a golden horizon glow; Normal and Toad Sage forms are also selectable live in Settings under Idle Companion). A playing or paused track replaces it with the cover (or title initial) and title.
 - Music colors: the dominant visible hue of a local cover tints the track title, timestamps, progress bar, and Play/Pause icon. Missing or monochrome artwork falls back to a stable color from the track title and artist. Artwork is never downloaded.
 - Selects a playing source through `org.mpris.MediaPlayer2.*` on the session bus. A monotonic clock advances progress between MPRIS updates, including players that report stale Position values.
 - Lyrics: first look for `~/.local/share/glacier/lyrics/Artist - Title.lrc` or `Title.lrc`; if absent, automatically search LRCLIB by track and artist (as Max explicitly chose). This sends the current track title and artist to LRCLIB. Synced LRC shows the current and next lines; untimed lyrics show an excerpt. Responses are cached in memory for the session.
 - No volume mixer or CPU monitor. Shelf and clipboard are provided in their own panels; album art is read from local MPRIS artwork URLs only.
 
-### Desktop app (Linux Mint XFCE)
+### Desktop app & Settings (Linux Mint XFCE)
 
-GlacierNotch is installed at `~/Applications/GlacierNotch`. Open it from the XFCE application menu; its desktop launcher starts `glaciernotch.service` in the user manager, so no terminal needs to remain open. The same launcher in `~/.config/autostart/glaciernotch.desktop` starts it once per desktop login. The old `glacier.desktop` autostart entry is removed to prevent duplicate windows. The launcher and service are kept in `packaging/` for future installation; after rebuilding, reinstall the binary to `~/Applications/GlacierNotch` and restart the user service to deploy a new version. User data remains under `~/.local/share/glacier/`.
+GlacierNotch is installed at `~/Applications/GlacierNotch`. Opening **GlacierNotch** from the XFCE application menu launches the standalone **GlacierNotch Settings** window (`--settings`), where you can enable/disable notch modules, configure the idle mascot (with live preview), tune Music/Lyrics/Controls/Focus/Shelf/Clips options, toggle login autostart and the XFCE system tray icon, and start/restart/stop `glaciernotch.service`. Login autostart (`~/.config/autostart/glaciernotch.desktop`, from `packaging/glaciernotch-autostart.desktop`) continues to start only the silent notch service on login without opening Settings. Preferences are saved atomically to `~/.config/glacier/config.json` and hot-reloaded live by the running notch. User data remains under `~/.local/share/glacier/`.
 
 ```sh
+~/Applications/GlacierNotch --settings          # open Settings & Feature Manager
 systemctl --user status glaciernotch.service
-systemctl --user restart glaciernotch.service  # after replacing the installed binary
-systemctl --user stop glaciernotch.service     # close it for this session
+systemctl --user restart glaciernotch.service   # after replacing the installed binary
+systemctl --user stop glaciernotch.service      # close it for this session
 ```
 
 For development only, you can run a separate process from the checkout, but stop the installed service first to avoid stacked notches:
@@ -51,4 +52,4 @@ The ignored `live_mpris_probe` test requires an MPRIS service named `org.mpris.M
 - X11-specific always-on-top positioning uses an override-redirect dropdown window. Wayland is not supported yet.
 - Playback position is estimated between player updates; a seek or a newly selected track resets the estimate.
 - Remote artwork URLs are not fetched. Missing local album art uses a track-derived color and monogram.
-- The hover window can take focus when clicked; this version has no global hotkey or tray icon.
+- No global hotkey yet; the override-redirect notch acquires X11 keyboard focus only while editing Quick Notes and restores focus to the previous window on save/cancel.

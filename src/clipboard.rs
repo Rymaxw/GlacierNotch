@@ -35,6 +35,7 @@ pub enum Action {
     TogglePin(String),
     Remove(String),
     Clear,
+    Configure { enabled: bool, max_clips: usize },
 }
 
 enum Request {
@@ -42,6 +43,7 @@ enum Request {
     TogglePin(String),
     Remove(String),
     Clear,
+    Configure { enabled: bool, max_clips: usize },
 }
 
 enum Update {
@@ -58,10 +60,15 @@ pub struct Clips {
 }
 
 impl Clips {
+    #[allow(dead_code)]
     pub fn start() -> Self {
+        Self::start_with_config(true, MAX_CLIPS)
+    }
+
+    pub fn start_with_config(enabled: bool, max_clips: usize) -> Self {
         let (request_tx, requests) = channel::<Request>();
         let (updates, update_rx) = channel::<Update>();
-        thread::spawn(move || run(requests, updates));
+        thread::spawn(move || run(requests, updates, enabled, max_clips.clamp(5, 200)));
         Self {
             tx: request_tx,
             rx: update_rx,
@@ -89,6 +96,7 @@ impl Clips {
             Action::TogglePin(text) => Request::TogglePin(text),
             Action::Remove(text) => Request::Remove(text),
             Action::Clear => Request::Clear,
+            Action::Configure { enabled, max_clips } => Request::Configure { enabled, max_clips },
         };
         let _ = self.tx.send(request);
     }
@@ -109,27 +117,26 @@ fn store_path() -> PathBuf {
     base.join("glacier/clips.json")
 }
 
-fn load() -> Vec<Clip> {
+fn load(max_clips: usize) -> Vec<Clip> {
     let Ok(raw) = std::fs::read(store_path()) else {
         return Vec::new();
     };
     let mut items: Vec<Clip> = serde_json::from_slice(&raw).unwrap_or_default();
     items.retain(|clip| !clip.text.trim().is_empty());
-    items.truncate(MAX_CLIPS);
+    items.truncate(max_clips);
     items
 }
 
 fn save(items: &[Clip]) {
-    let path = store_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_vec(items) {
-        let _ = std::fs::write(path, json);
-    }
+    let _ = glacier::storage::write_at(&store_path(), items);
 }
 
+#[allow(dead_code)]
 fn remember(items: &mut Vec<Clip>, text: &str) -> bool {
+    remember_with_limit(items, text, MAX_CLIPS)
+}
+
+fn remember_with_limit(items: &mut Vec<Clip>, text: &str, max_clips: usize) -> bool {
     let text = text.trim_end_matches('\u{0}');
     if text.trim().is_empty() || text.chars().count() > 20_000 {
         return false;
@@ -146,7 +153,7 @@ fn remember(items: &mut Vec<Clip>, text: &str) -> bool {
             pinned,
         },
     );
-    items.truncate(MAX_CLIPS);
+    items.truncate(max_clips);
     true
 }
 
@@ -154,8 +161,8 @@ fn atom(conn: &impl Connection, name: &[u8]) -> Result<Atom, Box<dyn std::error:
     Ok(conn.intern_atom(false, name)?.reply()?.atom)
 }
 
-fn run(requests: Receiver<Request>, updates: Sender<Update>) {
-    match session(requests, updates.clone()) {
+fn run(requests: Receiver<Request>, updates: Sender<Update>, enabled: bool, max_clips: usize) {
+    match session(requests, updates.clone(), enabled, max_clips) {
         Ok(()) => {}
         Err(error) => {
             let _ = updates.send(Update::Status(format!("clipboard unavailable: {error}")));
@@ -176,6 +183,8 @@ struct Atoms {
 fn session(
     requests: Receiver<Request>,
     updates: Sender<Update>,
+    mut enabled: bool,
+    mut max_clips: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (conn, screen_num) = x11rb::connect(None)?;
     let screen = &conn.setup().roots[screen_num];
@@ -203,7 +212,7 @@ fn session(
         property: atom(&conn, b"GLACIER_CLIP")?,
     };
 
-    let mut history = load();
+    let mut history = load(max_clips);
     let mut owned: Option<String> = None;
     // A Clear action must not immediately re-import the same selection that
     // was present before it. Stop suppressing as soon as its text changes.
@@ -219,10 +228,10 @@ fn session(
                     cleared_selection = None;
                     conn.set_selection_owner(window, atoms.clipboard, CURRENT_TIME)?;
                     conn.flush()?;
-                    if remember(&mut history, &text) {
+                    if enabled && remember_with_limit(&mut history, &text, max_clips) {
                         save(&history);
+                        let _ = updates.send(Update::History(history.clone()));
                     }
-                    let _ = updates.send(Update::History(history.clone()));
                 }
                 Request::TogglePin(text) => {
                     if let Some(clip) = history.iter_mut().find(|clip| clip.text == text) {
@@ -257,6 +266,18 @@ fn session(
                     save(&history);
                     let _ = updates.send(Update::History(history.clone()));
                 }
+                Request::Configure {
+                    enabled: next_enabled,
+                    max_clips: next_max,
+                } => {
+                    enabled = next_enabled;
+                    max_clips = next_max.clamp(5, 200);
+                    if history.len() > max_clips {
+                        history.truncate(max_clips);
+                        save(&history);
+                        let _ = updates.send(Update::History(history.clone()));
+                    }
+                }
             }
         }
 
@@ -267,7 +288,7 @@ fn session(
         }
 
         ticks = ticks.wrapping_add(1);
-        if ticks.is_multiple_of(6) {
+        if enabled && ticks.is_multiple_of(6) {
             let owner = conn.get_selection_owner(atoms.clipboard)?.reply()?.owner;
             if owner != 0
                 && owner != window
@@ -275,7 +296,7 @@ fn session(
                 && cleared_selection.as_deref() != Some(text.as_str())
             {
                 cleared_selection = None;
-                if remember(&mut history, &text) {
+                if remember_with_limit(&mut history, &text, max_clips) {
                     save(&history);
                     let _ = updates.send(Update::History(history.clone()));
                 }

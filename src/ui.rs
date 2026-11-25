@@ -12,9 +12,10 @@ use crate::focus::{self, Timer};
 use crate::lyrics::{LyricState, Lyrics};
 use crate::media::{Cmd, Track, next_rate};
 use crate::shelf::{self, Shelf};
+use glacier::config::{Config, IdleMode, TabId};
 use glacier::notes::{self, Notes};
 
-mod mascot;
+pub mod mascot;
 mod native;
 
 const PAGE_SIZE: usize = 5;
@@ -26,48 +27,20 @@ pub const H_EXPANDED: f32 = 284.0;
 pub const COLLAPSED_FADE: f32 = 0.40;
 
 const TAB_H: f32 = 26.0;
+const GEAR_W: f32 = 28.0;
 
 const BG: Color32 = Color32::from_rgb(9, 9, 12);
 const TEXT: Color32 = Color32::from_rgb(240, 240, 245);
 const MUTED: Color32 = Color32::from_rgb(150, 150, 162);
 const FAINT: Color32 = Color32::from_rgb(134, 134, 146);
-const ACCENT: Color32 = Color32::from_rgb(122, 211, 255);
 const TRACK: Color32 = Color32::from_rgb(28, 28, 35);
 const CHIP: Color32 = Color32::from_rgb(24, 24, 31);
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Tab {
-    #[default]
-    Music,
-    Control,
-    Focus,
-    Shelf,
-    Clips,
-}
+pub type Tab = TabId;
 
-impl Tab {
-    pub const ALL: [Tab; 5] = [Tab::Music, Tab::Control, Tab::Focus, Tab::Shelf, Tab::Clips];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Tab::Music => "Music",
-            Tab::Control => "Control",
-            Tab::Focus => "Focus",
-            Tab::Shelf => "Shelf",
-            Tab::Clips => "Clips",
-        }
-    }
-
-    pub fn step(self, forward: bool) -> Self {
-        let index = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
-        let len = Self::ALL.len();
-        let next = if forward {
-            (index + 1) % len
-        } else {
-            (index + len - 1) % len
-        };
-        Self::ALL[next]
-    }
+fn accent_color(config: &Config) -> Color32 {
+    let [r, g, b] = config.appearance.accent_rgb;
+    Color32::from_rgb(r, g, b)
 }
 
 /// Everything the notch can ask the app to do. One action per frame is enough:
@@ -85,6 +58,7 @@ pub enum Action {
     Shelf(shelf::Action),
     Clips(crate::clipboard::Action),
     Tab(Tab),
+    OpenSettings,
 }
 
 /// Drag state that has to survive between frames.
@@ -142,6 +116,19 @@ impl Interactions {
         self.page = 0;
     }
 
+    pub fn clear_keyboard_mode(&mut self) {
+        self.keyboard_mode = false;
+    }
+
+    pub fn sync_clips_mode(&mut self, clipboard_enabled: bool, notes_enabled: bool) {
+        if notes_enabled && !clipboard_enabled {
+            self.notes = true;
+        } else if clipboard_enabled && !notes_enabled {
+            self.notes = false;
+            self.editor = None;
+        }
+    }
+
     pub fn act(&mut self, action: UiAction, notes: &Notes) {
         match action {
             UiAction::Notes(value) => {
@@ -191,6 +178,8 @@ pub struct View<'a> {
     pub shelf: &'a Shelf,
     pub clips: &'a Clips,
     pub notes: &'a Notes,
+    pub config: &'a Config,
+    pub idle_clock: &'a str,
     pub hovering_files: bool,
 }
 
@@ -258,11 +247,12 @@ pub fn draw(root: &mut egui::Ui, state: &mut Interactions, view: &View<'_>) -> O
         Stroke::new(1.0, edge()),
         StrokeKind::Inside,
     );
+    let ui_accent = accent_color(view.config);
     if view.hovering_files {
         painter.rect_stroke(
             rect.shrink(1.0),
             corners(radius.saturating_sub(1)),
-            Stroke::new(1.5, ACCENT),
+            Stroke::new(1.5, ui_accent),
             StrokeKind::Inside,
         );
     }
@@ -297,13 +287,18 @@ pub fn draw(root: &mut egui::Ui, state: &mut Interactions, view: &View<'_>) -> O
         let mut body =
             painter.with_clip_rect(Rect::from_min_size(Pos2::ZERO, Vec2::new(W_EXPANDED, h)));
         body.set_opacity(((view.open - COLLAPSED_FADE) / (1.0 - COLLAPSED_FADE)).clamp(0.0, 1.0));
-        action = tab_bar(&body, w, view.tab, &pointer).map(Action::Tab);
-        let panel = match view.tab {
-            Tab::Music => music(&body, view, &pointer, state),
-            Tab::Control => control(&body, view, &pointer, state),
-            Tab::Focus => focus_panel(&body, view, &pointer),
-            Tab::Shelf => shelf_panel(&body, view, &pointer, state),
-            Tab::Clips => clips_panel(&body, view, &pointer, state),
+        action = tab_bar(&body, w, view.tab, view.config, &pointer);
+        let enabled_tabs = view.config.features.enabled_tabs();
+        let panel = if enabled_tabs.is_empty() {
+            all_disabled_panel(&body, w, &pointer, ui_accent)
+        } else {
+            match view.tab {
+                Tab::Music => music(&body, view, &pointer, state),
+                Tab::Control => control(&body, view, &pointer, state),
+                Tab::Focus => focus_panel(&body, view, &pointer),
+                Tab::Shelf => shelf_panel(&body, view, &pointer, state),
+                Tab::Clips => clips_panel(&body, view, &pointer, state),
+            }
         };
         if action.is_none() {
             action = panel;
@@ -327,41 +322,81 @@ pub fn draw(root: &mut egui::Ui, state: &mut Interactions, view: &View<'_>) -> O
     action
 }
 
-fn tab_bar(painter: &egui::Painter, w: f32, active: Tab, pointer: &Pointer) -> Option<Tab> {
+fn tab_strip_width(w: f32, config: &Config) -> f32 {
+    if config.appearance.show_settings_button {
+        (w - GEAR_W).max(40.0)
+    } else {
+        w
+    }
+}
+
+fn gear_rect(w: f32) -> Rect {
+    Rect::from_min_size(Pos2::new(w - GEAR_W, 0.0), Vec2::new(GEAR_W, TAB_H - 4.0))
+}
+
+fn tab_bar(
+    painter: &egui::Painter,
+    w: f32,
+    active: Tab,
+    config: &Config,
+    pointer: &Pointer,
+) -> Option<Action> {
     let font = tab_font();
-    // Equal-width slots so a tap target exists even for the shortest label.
-    let slot = w / Tab::ALL.len() as f32;
+    let enabled = config.features.enabled_tabs();
+    let accent = accent_color(config);
     let mut hit = None;
 
-    for (index, tab) in Tab::ALL.iter().enumerate() {
-        let rect = Rect::from_min_size(
-            Pos2::new(slot * index as f32, 0.0),
-            Vec2::new(slot, TAB_H - 4.0),
-        );
-        let selected = *tab == active;
-        let hovered = pointer.at.is_some_and(|p| rect.contains(p));
-        painter.text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            tab.label(),
-            font.clone(),
-            if selected {
-                TEXT
-            } else if hovered {
-                MUTED
-            } else {
-                FAINT
-            },
-        );
-        if selected {
-            let underline = Rect::from_min_size(
-                Pos2::new(rect.center().x - 14.0, TAB_H - 4.0),
-                Vec2::new(28.0, 2.0),
+    if !enabled.is_empty() {
+        let strip_w = tab_strip_width(w, config);
+        // Equal-width slots so a tap target exists even for the shortest label.
+        let slot = strip_w / enabled.len() as f32;
+
+        for (index, tab) in enabled.iter().enumerate() {
+            let rect = Rect::from_min_size(
+                Pos2::new(slot * index as f32, 0.0),
+                Vec2::new(slot, TAB_H - 4.0),
             );
-            painter.rect_filled(underline, CornerRadius::same(1), ACCENT);
+            let selected = *tab == active;
+            let hovered = pointer.at.is_some_and(|p| rect.contains(p));
+            painter.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                tab.label(),
+                font.clone(),
+                if selected {
+                    TEXT
+                } else if hovered {
+                    MUTED
+                } else {
+                    FAINT
+                },
+            );
+            if selected {
+                let underline = Rect::from_min_size(
+                    Pos2::new(rect.center().x - 14.0, TAB_H - 4.0),
+                    Vec2::new(28.0, 2.0),
+                );
+                painter.rect_filled(underline, CornerRadius::same(1), accent);
+            }
+            if pointer.live && pointer.clicked && hovered {
+                hit = Some(Action::Tab(*tab));
+            }
         }
+    }
+
+    if config.appearance.show_settings_button {
+        let gear = gear_rect(w);
+        let hovered = pointer.at.is_some_and(|p| gear.contains(p));
+        if hovered {
+            painter.rect_filled(
+                gear.shrink2(Vec2::new(3.0, 2.0)),
+                CornerRadius::same(5),
+                CHIP,
+            );
+        }
+        gear_icon(painter, gear.center(), if hovered { accent } else { FAINT });
         if pointer.live && pointer.clicked && hovered {
-            hit = Some(*tab);
+            hit = Some(Action::OpenSettings);
         }
     }
 
@@ -373,6 +408,43 @@ fn tab_bar(painter: &egui::Painter, w: f32, active: Tab, pointer: &Pointer) -> O
     hit
 }
 
+fn gear_icon(painter: &egui::Painter, center: Pos2, color: Color32) {
+    let outer = 5.0;
+    let inner = 2.4;
+    painter.circle_stroke(center, 3.6, Stroke::new(1.3, color));
+    for i in 0..6 {
+        let angle = i as f32 * std::f32::consts::TAU / 6.0;
+        let dir = Vec2::new(angle.cos(), angle.sin());
+        painter.line_segment(
+            [center + dir * (inner + 1.4), center + dir * (outer + 1.2)],
+            Stroke::new(1.4, color),
+        );
+    }
+}
+
+fn all_disabled_panel(
+    painter: &egui::Painter,
+    w: f32,
+    pointer: &Pointer,
+    accent: Color32,
+) -> Option<Action> {
+    painter.text(
+        Pos2::new(w / 2.0, 114.0),
+        Align2::CENTER_CENTER,
+        "All notch modules are disabled",
+        sub_font(),
+        MUTED,
+    );
+    let btn = Rect::from_center_size(Pos2::new(w / 2.0, 152.0), Vec2::new(124.0, 28.0));
+    let hovered = pointer.at.is_some_and(|p| btn.contains(p));
+    chip(painter, btn, "Open Settings", true, hovered, accent);
+    if pointer.live && pointer.clicked && hovered {
+        Some(Action::OpenSettings)
+    } else {
+        None
+    }
+}
+
 fn music(
     painter: &egui::Painter,
     view: &View<'_>,
@@ -381,7 +453,9 @@ fn music(
 ) -> Option<Action> {
     let w = view.w;
     let track = view.track;
-    let accent = track_accent(track, view.artwork);
+    let ui_accent = accent_color(view.config);
+    let accent = track_accent(track, view.artwork, view.config);
+    let seek_step = view.config.music.seek_step_secs as f64;
     let mut action = None;
 
     let dot = Pos2::new(16.0, 48.0);
@@ -530,52 +604,54 @@ fn music(
 
     if pointer.live && pointer.clicked && !state.progress {
         if elapsed_hover {
-            action = Some(Action::Transport(Cmd::SeekBy(-5.0)));
+            action = Some(Action::Transport(Cmd::SeekBy(-seek_step)));
         } else if remaining_hover {
-            action = Some(Action::Transport(Cmd::SeekBy(5.0)));
+            action = Some(Action::Transport(Cmd::SeekBy(seek_step)));
         }
     }
 
     // ── lyrics: the active and next line are seek targets ───────────────────
-    let [current, next] = lyric_rows(view);
-    let line_now = Rect::from_min_max(Pos2::new(16.0, 168.0), Pos2::new(w - 16.0, 190.0));
-    let line_next = Rect::from_min_max(Pos2::new(16.0, 190.0), Pos2::new(w - 16.0, 210.0));
-    let now_hover = seekable && pointer.at.is_some_and(|p| line_now.contains(p));
-    let next_hover = seekable && pointer.at.is_some_and(|p| line_next.contains(p));
+    if view.config.music.show_lyrics {
+        let [current, next] = lyric_rows(view);
+        let line_now = Rect::from_min_max(Pos2::new(16.0, 168.0), Pos2::new(w - 16.0, 190.0));
+        let line_next = Rect::from_min_max(Pos2::new(16.0, 190.0), Pos2::new(w - 16.0, 210.0));
+        let now_hover = seekable && pointer.at.is_some_and(|p| line_now.contains(p));
+        let next_hover = seekable && pointer.at.is_some_and(|p| line_next.contains(p));
 
-    painter.text(
-        Pos2::new(w / 2.0, 179.0),
-        Align2::CENTER_CENTER,
-        clip(
-            painter,
-            &current.text,
-            &FontId::proportional(13.0),
-            w - 36.0,
-        ),
-        FontId::proportional(13.0),
-        if now_hover {
-            ACCENT
-        } else if current.synced {
-            TEXT
-        } else {
-            MUTED
-        },
-    );
-    if !next.text.is_empty() {
         painter.text(
-            Pos2::new(w / 2.0, 198.0),
+            Pos2::new(w / 2.0, 179.0),
             Align2::CENTER_CENTER,
-            clip(painter, &next.text, &FontId::proportional(11.0), w - 36.0),
-            FontId::proportional(11.0),
-            if next_hover { ACCENT } else { MUTED },
+            clip(
+                painter,
+                &current.text,
+                &FontId::proportional(13.0),
+                w - 36.0,
+            ),
+            FontId::proportional(13.0),
+            if now_hover {
+                ui_accent
+            } else if current.synced {
+                TEXT
+            } else {
+                MUTED
+            },
         );
-    }
+        if !next.text.is_empty() {
+            painter.text(
+                Pos2::new(w / 2.0, 198.0),
+                Align2::CENTER_CENTER,
+                clip(painter, &next.text, &FontId::proportional(11.0), w - 36.0),
+                FontId::proportional(11.0),
+                if next_hover { ui_accent } else { MUTED },
+            );
+        }
 
-    if pointer.live && pointer.clicked && action.is_none() {
-        if now_hover && let Some(at) = current.at {
-            action = Some(Action::Seek(at));
-        } else if next_hover && let Some(at) = next.at {
-            action = Some(Action::Seek(at));
+        if pointer.live && pointer.clicked && action.is_none() {
+            if now_hover && let Some(at) = current.at {
+                action = Some(Action::Seek(at));
+            } else if next_hover && let Some(at) = next.at {
+                action = Some(Action::Seek(at));
+            }
         }
     }
 
@@ -643,15 +719,16 @@ fn music(
     }
 
     // ── scroll anywhere on the panel steps the track ────────────────────────
-    if seekable
+    if view.config.music.scroll_seek
+        && seekable
         && action.is_none()
         && pointer.scroll.abs() > 0.5
         && pointer.at.is_some_and(|p| p.y > 34.0)
     {
         action = Some(Action::Transport(Cmd::SeekBy(if pointer.scroll > 0.0 {
-            5.0
+            seek_step
         } else {
-            -5.0
+            -seek_step
         })));
     }
 
@@ -737,24 +814,28 @@ fn control(
     let w = view.w;
     let mut action = None;
     let controls = view.controls;
+    let ui_accent = accent_color(view.config);
 
-    let rows: [(u8, &str, f32, bool); 2] = [
-        (0, "Volume", controls.volume, controls.has_volume()),
-        (
+    let mut rows: Vec<(u8, &str, f32, bool)> = Vec::new();
+    if view.config.features.volume_enabled() {
+        rows.push((0, "Volume", controls.volume, controls.has_volume()));
+    }
+    if view.config.features.brightness_enabled() {
+        rows.push((
             1,
             "Brightness",
             controls.brightness,
             controls.has_brightness(),
-        ),
-    ];
+        ));
+    }
 
-    for (index, label, value, enabled) in rows {
+    for (slot, (index, label, value, enabled)) in rows.into_iter().enumerate() {
         let max = if index == 0 {
-            controls::VOLUME_MAX
+            controls.volume_max()
         } else {
             1.0
         };
-        let top = 92.0 + index as f32 * 72.0;
+        let top = 92.0 + slot as f32 * 72.0;
         painter.text(
             Pos2::new(16.0, top),
             Align2::LEFT_CENTER,
@@ -805,8 +886,8 @@ fn control(
         let ratio = (shown / max).clamp(0.0, 1.0);
         if enabled {
             let filled = Rect::from_min_max(bar.min, Pos2::new(16.0 + span * ratio, bar.max.y));
-            painter.rect_filled(filled, CornerRadius::same(3), ACCENT);
-            painter.circle_filled(Pos2::new(filled.max.x, bar.center().y), 4.0, ACCENT);
+            painter.rect_filled(filled, CornerRadius::same(3), ui_accent);
+            painter.circle_filled(Pos2::new(filled.max.x, bar.center().y), 4.0, ui_accent);
         }
     }
 
@@ -836,6 +917,7 @@ fn slider_action(index: u8, value: f32, force: bool) -> Action {
 fn focus_panel(painter: &egui::Painter, view: &View<'_>, pointer: &Pointer) -> Option<Action> {
     let w = view.w;
     let timer = view.timer;
+    let ui_accent = accent_color(view.config);
     let mut action = None;
 
     painter.text(
@@ -863,7 +945,7 @@ fn focus_panel(painter: &egui::Painter, view: &View<'_>, pointer: &Pointer) -> O
         painter.rect_filled(
             Rect::from_min_max(bar.min, Pos2::new(16.0 + (w - 32.0) * progress, 156.0)),
             CornerRadius::same(2),
-            ACCENT,
+            ui_accent,
         );
     }
 
@@ -881,10 +963,12 @@ fn focus_panel(painter: &egui::Painter, view: &View<'_>, pointer: &Pointer) -> O
         Vec2::new(108.0, 26.0),
     );
 
+    let focus_label = timer.mode_label(focus::Mode::Focus);
+    let break_label = timer.mode_label(focus::Mode::Break);
     chip(
         painter,
         mode_focus,
-        focus::Mode::Focus.label(),
+        &focus_label,
         timer.mode() == focus::Mode::Focus,
         pointer.at.is_some_and(|p| mode_focus.contains(p)),
         FAINT,
@@ -892,7 +976,7 @@ fn focus_panel(painter: &egui::Painter, view: &View<'_>, pointer: &Pointer) -> O
     chip(
         painter,
         mode_break,
-        focus::Mode::Break.label(),
+        &break_label,
         timer.mode() == focus::Mode::Break,
         pointer.at.is_some_and(|p| mode_break.contains(p)),
         FAINT,
@@ -903,7 +987,7 @@ fn focus_panel(painter: &egui::Painter, view: &View<'_>, pointer: &Pointer) -> O
         if timer.running() { "Pause" } else { "Start" },
         timer.running(),
         pointer.at.is_some_and(|p| toggle.contains(p)),
-        ACCENT,
+        ui_accent,
     );
     chip(
         painter,
@@ -933,7 +1017,7 @@ fn focus_panel(painter: &egui::Painter, view: &View<'_>, pointer: &Pointer) -> O
         let dots = timer.completed().min(8) as usize;
         let start = w / 2.0 - (dots as f32 - 1.0) * 6.0;
         for i in 0..dots {
-            painter.circle_filled(Pos2::new(start + i as f32 * 12.0, 256.0), 2.5, ACCENT);
+            painter.circle_filled(Pos2::new(start + i as f32 * 12.0, 256.0), 2.5, ui_accent);
         }
     }
 
@@ -1045,30 +1129,35 @@ fn clips_panel(
 ) -> Option<Action> {
     let w = view.w;
     let clips = view.clips;
+    let ui_accent = accent_color(view.config);
+    let clips_on = view.config.features.clipboard;
+    let notes_on = view.config.features.notes;
     let mut action = None;
 
-    for (rect, label, selected) in [
-        (
-            Rect::from_min_size(Pos2::new(16.0, 34.0), Vec2::new(73.0, 24.0)),
-            "History",
-            !state.notes,
-        ),
-        (
-            Rect::from_min_size(Pos2::new(97.0, 34.0), Vec2::new(59.0, 24.0)),
-            "Notes",
-            state.notes,
-        ),
-    ] {
+    if clips_on {
+        let rect = Rect::from_min_size(Pos2::new(16.0, 34.0), Vec2::new(73.0, 24.0));
         chip(
             painter,
             rect,
-            label,
-            selected,
+            "History",
+            !state.notes || !notes_on,
             pointer.at.is_some_and(|p| rect.contains(p)),
-            ACCENT,
+            ui_accent,
         );
     }
-    if state.notes {
+    if notes_on {
+        let x = if clips_on { 97.0 } else { 16.0 };
+        let rect = Rect::from_min_size(Pos2::new(x, 34.0), Vec2::new(59.0, 24.0));
+        chip(
+            painter,
+            rect,
+            "Notes",
+            state.notes || !clips_on,
+            pointer.at.is_some_and(|p| rect.contains(p)),
+            ui_accent,
+        );
+    }
+    if notes_on && (state.notes || !clips_on) {
         notes_panel(painter, view, pointer, state);
         return None;
     }
@@ -1107,7 +1196,7 @@ fn clips_panel(
             Align2::LEFT_TOP,
             clip(painter, &preview, &sub_font(), w - 180.0),
             sub_font(),
-            if entry.pinned { ACCENT } else { TEXT },
+            if entry.pinned { ui_accent } else { TEXT },
         );
         painter.text(
             Pos2::new(18.0, top + 22.0),
@@ -1334,10 +1423,46 @@ fn collapsed(painter: &egui::Painter, view: &View<'_>) {
         track,
         artwork,
         seconds,
+        config,
+        idle_clock,
         ..
     } = *view;
     if shows_mascot(track) {
-        mascot::draw(painter, Pos2::new(w / 2.0, h / 2.0), seconds);
+        let center = Pos2::new(w / 2.0, h / 2.0);
+        match config.mascot.idle_mode {
+            IdleMode::Mascot => {
+                mascot::draw_with_options(
+                    painter,
+                    center,
+                    seconds,
+                    mascot::MascotOptions {
+                        mode: mascot::Mode::from(config.mascot.form),
+                        show_aura: config.mascot.show_aura,
+                        animate: config.mascot.animate,
+                        blink: config.mascot.blink,
+                    },
+                );
+            }
+            IdleMode::Clock => {
+                painter.text(
+                    center,
+                    Align2::CENTER_CENTER,
+                    idle_clock,
+                    FontId::new(13.5, egui::FontFamily::Proportional),
+                    TEXT,
+                );
+            }
+            IdleMode::Minimal => {
+                painter.circle_filled(center + Vec2::new(-28.0, 0.0), 3.0, accent_color(config));
+                painter.text(
+                    center + Vec2::new(6.0, 0.0),
+                    Align2::CENTER_CENTER,
+                    "glacier",
+                    FontId::new(11.5, egui::FontFamily::Proportional),
+                    MUTED,
+                );
+            }
+        }
         return;
     }
 
@@ -1367,7 +1492,7 @@ fn collapsed(painter: &egui::Painter, view: &View<'_>) {
         Align2::CENTER_CENTER,
         clip(painter, &track.title, &font, w - 50.0),
         font,
-        track_accent(track, artwork),
+        track_accent(track, artwork, config),
     );
 }
 
@@ -1388,9 +1513,12 @@ fn track_fallback_color(track: &Track) -> Color32 {
     }
 }
 
-fn track_accent(track: &Track, artwork: &crate::artwork::Artwork) -> Color32 {
+fn track_accent(track: &Track, artwork: &crate::artwork::Artwork, config: &Config) -> Color32 {
     if track.title.trim().is_empty() {
         return FAINT;
+    }
+    if !config.appearance.dynamic_music_accent {
+        return accent_color(config);
     }
     artwork
         .accent()

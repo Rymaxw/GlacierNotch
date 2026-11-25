@@ -19,19 +19,36 @@ fn target(id: impl Into<String>, rect: Rect, action: Action) -> Target {
 fn targets(view: &View<'_>, state: &Interactions) -> Vec<Target> {
     let w = view.w;
     let mut list = Vec::new();
-    for (index, tab) in Tab::ALL.iter().enumerate() {
+    let enabled_tabs = view.config.features.enabled_tabs();
+    if !enabled_tabs.is_empty() {
+        let strip_w = tab_strip_width(w, view.config);
+        let slot = strip_w / enabled_tabs.len() as f32;
+        for (index, tab) in enabled_tabs.iter().enumerate() {
+            list.push(target(
+                format!("tab-{index}"),
+                Rect::from_min_size(
+                    Pos2::new(slot * index as f32, 0.0),
+                    Vec2::new(slot, TAB_H - 4.0),
+                ),
+                Action::Tab(*tab),
+            ));
+        }
+    }
+    if view.config.appearance.show_settings_button {
+        list.push(target("settings-gear", gear_rect(w), Action::OpenSettings));
+    }
+    if enabled_tabs.is_empty() {
         list.push(target(
-            format!("tab-{index}"),
-            Rect::from_min_size(
-                Pos2::new(w / 5.0 * index as f32, 0.0),
-                Vec2::new(w / 5.0, TAB_H - 4.0),
-            ),
-            Action::Tab(*tab),
+            "open-settings-empty",
+            Rect::from_center_size(Pos2::new(w / 2.0, 152.0), Vec2::new(124.0, 28.0)),
+            Action::OpenSettings,
         ));
+        return list;
     }
     match view.tab {
         Tab::Music => {
             let track = view.track;
+            let seek_step = view.config.music.seek_step_secs as f64;
             let seekable = track.can_seek && track.length.is_some_and(|length| length > 0.0);
             if seekable {
                 let mut progress = target(
@@ -40,30 +57,32 @@ fn targets(view: &View<'_>, state: &Interactions) -> Vec<Target> {
                     Action::Seek(track.position),
                 );
                 progress.arrows = Some([
-                    Action::Transport(Cmd::SeekBy(-5.0)),
-                    Action::Transport(Cmd::SeekBy(5.0)),
+                    Action::Transport(Cmd::SeekBy(-seek_step)),
+                    Action::Transport(Cmd::SeekBy(seek_step)),
                 ]);
                 list.push(progress);
                 list.push(target(
                     "elapsed",
                     Rect::from_min_max(Pos2::new(16.0, 150.0), Pos2::new(70.0, 166.0)),
-                    Action::Transport(Cmd::SeekBy(-5.0)),
+                    Action::Transport(Cmd::SeekBy(-seek_step)),
                 ));
                 list.push(target(
                     "remaining",
                     Rect::from_min_max(Pos2::new(w - 70.0, 150.0), Pos2::new(w - 16.0, 166.0)),
-                    Action::Transport(Cmd::SeekBy(5.0)),
+                    Action::Transport(Cmd::SeekBy(seek_step)),
                 ));
-                for (index, row) in lyric_rows(view).into_iter().enumerate() {
-                    if let Some(at) = row.at {
-                        list.push(target(
-                            format!("lyric-{index}"),
-                            Rect::from_min_max(
-                                Pos2::new(16.0, 168.0 + index as f32 * 22.0),
-                                Pos2::new(w - 16.0, 190.0 + index as f32 * 20.0),
-                            ),
-                            Action::Seek(at),
-                        ));
+                if view.config.music.show_lyrics {
+                    for (index, row) in lyric_rows(view).into_iter().enumerate() {
+                        if let Some(at) = row.at {
+                            list.push(target(
+                                format!("lyric-{index}"),
+                                Rect::from_min_max(
+                                    Pos2::new(16.0, 168.0 + index as f32 * 22.0),
+                                    Pos2::new(w - 16.0, 190.0 + index as f32 * 20.0),
+                                ),
+                                Action::Seek(at),
+                            ));
+                        }
                     }
                 }
             }
@@ -90,12 +109,20 @@ fn targets(view: &View<'_>, state: &Interactions) -> Vec<Target> {
             }
         }
         Tab::Control => {
-            for (index, value, enabled) in [
-                (0, view.controls.volume, view.controls.has_volume()),
-                (1, view.controls.brightness, view.controls.has_brightness()),
-            ] {
+            let mut rows = Vec::new();
+            if view.config.features.volume_enabled() {
+                rows.push((0u8, view.controls.volume, view.controls.has_volume()));
+            }
+            if view.config.features.brightness_enabled() {
+                rows.push((
+                    1u8,
+                    view.controls.brightness,
+                    view.controls.has_brightness(),
+                ));
+            }
+            for (slot, (index, value, enabled)) in rows.into_iter().enumerate() {
                 if enabled {
-                    let top = 92.0 + index as f32 * 72.0;
+                    let top = 92.0 + slot as f32 * 72.0;
                     let mut slider = target(
                         format!("slider-{index}"),
                         Rect::from_min_max(
@@ -105,7 +132,7 @@ fn targets(view: &View<'_>, state: &Interactions) -> Vec<Target> {
                         slider_action(index, value, true),
                     );
                     let max = if index == 0 {
-                        controls::VOLUME_MAX
+                        view.controls.volume_max()
                     } else {
                         1.0
                     };
@@ -174,17 +201,24 @@ fn targets(view: &View<'_>, state: &Interactions) -> Vec<Target> {
             }
         }
         Tab::Clips => {
-            list.push(target(
-                "history-view",
-                Rect::from_min_size(Pos2::new(16.0, 34.0), Vec2::new(73.0, 24.0)),
-                Action::Ui(UiAction::Notes(false)),
-            ));
-            list.push(target(
-                "notes-view",
-                Rect::from_min_size(Pos2::new(97.0, 34.0), Vec2::new(59.0, 24.0)),
-                Action::Ui(UiAction::Notes(true)),
-            ));
-            if state.notes {
+            let clips_on = view.config.features.clipboard;
+            let notes_on = view.config.features.notes;
+            if clips_on {
+                list.push(target(
+                    "history-view",
+                    Rect::from_min_size(Pos2::new(16.0, 34.0), Vec2::new(73.0, 24.0)),
+                    Action::Ui(UiAction::Notes(false)),
+                ));
+            }
+            if notes_on {
+                let x = if clips_on { 97.0 } else { 16.0 };
+                list.push(target(
+                    "notes-view",
+                    Rect::from_min_size(Pos2::new(x, 34.0), Vec2::new(59.0, 24.0)),
+                    Action::Ui(UiAction::Notes(true)),
+                ));
+            }
+            if notes_on && (state.notes || !clips_on) {
                 list.push(target(
                     "new-note",
                     Rect::from_min_size(Pos2::new(w - 96.0, 34.0), Vec2::new(80.0, 24.0)),
@@ -303,10 +337,11 @@ pub(super) fn draw(
                     state.focus_first = false;
                 }
                 if response.has_focus() {
+                    let focus_color = accent_color(view.config);
                     ui.painter().rect_stroke(
                         rect.shrink(1.0),
                         CornerRadius::same(4),
-                        Stroke::new(1.5, ACCENT),
+                        Stroke::new(1.5, focus_color),
                         StrokeKind::Inside,
                     );
                     if let Some(arrows) = target.arrows {
@@ -346,7 +381,7 @@ fn editor(ui: &mut egui::Ui, state: &mut Interactions, notes: &Notes) -> Option<
     );
     ui.visuals_mut().override_text_color = Some(TEXT);
     ui.visuals_mut().extreme_bg_color = BG;
-    ui.visuals_mut().selection.stroke = Stroke::new(1.0, ACCENT);
+    ui.visuals_mut().selection.stroke = Stroke::new(1.0, Color32::from_rgb(122, 211, 255));
     let response = ui.put(
         Rect::from_min_max(Pos2::new(26.0, 94.0), Pos2::new(w - 26.0, 190.0)),
         egui::TextEdit::multiline(&mut draft.text)
@@ -362,7 +397,7 @@ fn editor(ui: &mut egui::Ui, state: &mut Interactions, notes: &Notes) -> Option<
     }
     let save = Rect::from_min_size(Pos2::new(w - 172.0, 202.0), Vec2::new(70.0, 24.0));
     let cancel = Rect::from_min_size(Pos2::new(w - 94.0, 202.0), Vec2::new(70.0, 24.0));
-    let mut save_clicked = ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl);
+    let mut save_clicked = ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Enter));
     let mut cancel_clicked = false;
     for (id, rect, label) in [
         ("save-note", save, "Save"),
@@ -374,7 +409,7 @@ fn editor(ui: &mut egui::Ui, state: &mut Interactions, notes: &Notes) -> Option<
             ui.painter().rect_stroke(
                 rect,
                 CornerRadius::same(6),
-                Stroke::new(1.5, ACCENT),
+                Stroke::new(1.5, Color32::from_rgb(122, 211, 255)),
                 StrokeKind::Inside,
             );
         }

@@ -17,10 +17,18 @@ pub fn data_path(name: &str) -> PathBuf {
     base.join("glacier").join(name)
 }
 
-pub fn read_at<T: DeserializeOwned>(path: &Path) -> io::Result<Vec<T>> {
+pub fn config_path(name: &str) -> PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("glacier").join(name)
+}
+
+fn read_bytes_at(path: &Path) -> io::Result<Option<Vec<u8>>> {
     let file = match fs::File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
     let mut raw = Vec::new();
@@ -31,11 +39,10 @@ pub fn read_at<T: DeserializeOwned>(path: &Path) -> io::Result<Vec<T>> {
             "store exceeds size limit",
         ));
     }
-    serde_json::from_slice(&raw).map_err(io::Error::other)
+    Ok(Some(raw))
 }
 
-pub fn write_at<T: Serialize>(path: &Path, values: &[T]) -> io::Result<()> {
-    let raw = serde_json::to_vec(values).map_err(io::Error::other)?;
+fn write_bytes_at(path: &Path, raw: &[u8]) -> io::Result<()> {
     if raw.len() as u64 > MAX_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -55,7 +62,7 @@ pub fn write_at<T: Serialize>(path: &Path, values: &[T]) -> io::Result<()> {
         .mode(0o600)
         .open(&temp)?;
     let result = (|| {
-        file.write_all(&raw)?;
+        file.write_all(raw)?;
         file.sync_all()?;
         fs::rename(&temp, path)
     })();
@@ -63,6 +70,32 @@ pub fn write_at<T: Serialize>(path: &Path, values: &[T]) -> io::Result<()> {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+pub fn read_at<T: DeserializeOwned>(path: &Path) -> io::Result<Vec<T>> {
+    let Some(raw) = read_bytes_at(path)? else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_slice(&raw).map_err(io::Error::other)
+}
+
+pub fn write_at<T: Serialize>(path: &Path, values: &[T]) -> io::Result<()> {
+    let raw = serde_json::to_vec(values).map_err(io::Error::other)?;
+    write_bytes_at(path, &raw)
+}
+
+pub fn read_object_at<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+    let Some(raw) = read_bytes_at(path)? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&raw)
+        .map(Some)
+        .map_err(io::Error::other)
+}
+
+pub fn write_object_at<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    let raw = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
+    write_bytes_at(path, &raw)
 }
 
 #[cfg(test)]

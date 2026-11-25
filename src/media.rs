@@ -170,7 +170,7 @@ impl PlaybackClock {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Cmd {
     PlayPause,
     Next,
@@ -180,6 +180,10 @@ pub enum Cmd {
     /// Relative nudge in seconds.
     SeekBy(f64),
     SetRate(f64),
+    Configure {
+        enabled: bool,
+        ignored_players: Vec<String>,
+    },
 }
 
 pub struct Media {
@@ -190,11 +194,16 @@ pub struct Media {
 impl Media {
     /// Spawn the D-Bus worker. With `offline` the worker never starts and
     /// `poll` returns nothing, which is what the demo mode wants.
+    #[allow(dead_code)]
     pub fn start(offline: bool) -> Self {
+        Self::start_with_config(offline, true, Vec::new())
+    }
+
+    pub fn start_with_config(offline: bool, enabled: bool, ignored_players: Vec<String>) -> Self {
         let (track_tx, track_rx) = channel();
         let (cmd_tx, cmd_rx) = channel();
         if !offline {
-            thread::spawn(move || worker(track_tx, cmd_rx));
+            thread::spawn(move || worker(track_tx, cmd_rx, enabled, ignored_players));
         }
         Self {
             rx: track_rx,
@@ -216,22 +225,55 @@ impl Media {
     }
 }
 
-fn worker(tx: Sender<Track>, rx: Receiver<Cmd>) {
+fn worker(
+    tx: Sender<Track>,
+    rx: Receiver<Cmd>,
+    mut enabled: bool,
+    mut ignored_players: Vec<String>,
+) {
     let mut conn: Option<Connection> = None;
+    let mut emitted_empty = false;
 
     loop {
+        let mut pending = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                Cmd::Configure {
+                    enabled: next_enabled,
+                    ignored_players: next_ignored,
+                } => {
+                    enabled = next_enabled;
+                    ignored_players = next_ignored;
+                    if !enabled {
+                        emitted_empty = false;
+                    }
+                }
+                other => pending.push(other),
+            }
+        }
+
+        if !enabled {
+            if !emitted_empty {
+                let _ = tx.send(Track::default());
+                emitted_empty = true;
+            }
+            thread::sleep(POLL);
+            continue;
+        }
+        emitted_empty = false;
+
         if conn.is_none() {
             conn = Connection::session().ok();
         }
 
         if let Some(c) = conn.as_ref() {
-            let (track, target) = match snapshot(c) {
+            let (track, target) = match snapshot_filtered(c, &ignored_players) {
                 Ok((track, name)) => (track, Some(name)),
                 Err(_) => (Track::default(), None),
             };
             let _ = tx.send(track.clone());
 
-            while let Ok(cmd) = rx.try_recv() {
+            for cmd in pending {
                 if let Some(dest) = target.as_deref()
                     && let Err(error) = dispatch(c, cmd, dest, &track)
                 {
@@ -244,9 +286,26 @@ fn worker(tx: Sender<Track>, rx: Receiver<Cmd>) {
     }
 }
 
+fn is_ignored_player(bus_name: &str, identity: &str, ignored: &[String]) -> bool {
+    let bus_lower = bus_name.to_lowercase();
+    let id_lower = identity.to_lowercase();
+    ignored.iter().any(|pattern| {
+        let needle = pattern.trim().to_lowercase();
+        !needle.is_empty() && (bus_lower.contains(&needle) || id_lower.contains(&needle))
+    })
+}
+
 /// Pick the player to display: a playing one wins, otherwise the first that
 /// exposes the MPRIS player interface.
+#[allow(dead_code)]
 fn snapshot(conn: &Connection) -> Result<(Track, String), Box<dyn std::error::Error>> {
+    snapshot_filtered(conn, &[])
+}
+
+fn snapshot_filtered(
+    conn: &Connection,
+    ignored_players: &[String],
+) -> Result<(Track, String), Box<dyn std::error::Error>> {
     let bus = Proxy::new(
         conn,
         "org.freedesktop.DBus",
@@ -264,9 +323,15 @@ fn snapshot(conn: &Connection) -> Result<(Track, String), Box<dyn std::error::Er
     let mut best: Option<(Track, String)> = None;
 
     for name in candidates {
+        if is_ignored_player(&name, "", ignored_players) {
+            continue;
+        }
         let Ok(track) = read_player(conn, &name) else {
             continue;
         };
+        if is_ignored_player(&name, &track.player, ignored_players) {
+            continue;
+        }
         if track.is_playing() {
             return Ok((track, name));
         }
@@ -412,6 +477,7 @@ fn dispatch(conn: &Connection, what: Cmd, dest: &str, last: &Track) -> zbus::Res
                 player.set_property("Rate", rate)?;
             }
         }
+        Cmd::Configure { .. } => {}
     }
     Ok(())
 }

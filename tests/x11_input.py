@@ -15,6 +15,7 @@ class XInput:
             "XFlush": ([p], i),
             "XCloseDisplay": ([p], i),
             "XQueryPointer": ([p, u] + [p] * 7, i),
+            "XGetInputFocus": ([p, p, p], i),
             "XSetInputFocus": ([p, u, i, u], i),
             "XStringToKeysym": ([ctypes.c_char_p], u),
             "XKeysymToKeycode": ([p, u], ctypes.c_ubyte),
@@ -65,6 +66,12 @@ class XInput:
         self.x.XSetInputFocus(self.handle, window, 1, 0)
         self.x.XFlush(self.handle)
         time.sleep(0.1)
+
+    def get_focus(self):
+        focus = ctypes.c_ulong()
+        revert_to = ctypes.c_int()
+        self.x.XGetInputFocus(self.handle, ctypes.byref(focus), ctypes.byref(revert_to))
+        return focus.value
 
     def _key_event(self, name, down):
         symbol = self.x.XStringToKeysym(name.encode())

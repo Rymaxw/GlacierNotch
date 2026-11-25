@@ -22,31 +22,49 @@ pub struct Line {
     pub text: String,
 }
 
+struct LyricRequest {
+    title: String,
+    artist: String,
+    duration: Option<f64>,
+    online_lrclib: bool,
+}
+
 pub struct Lyrics {
-    tx: Sender<(String, String, Option<f64>)>,
+    tx: Sender<LyricRequest>,
     rx: Receiver<(String, LyricState)>,
     pub key: String,
     pub state: LyricState,
+    raw_title: String,
+    raw_artist: String,
     duration: Option<f64>,
+    enabled: bool,
+    online_lrclib: bool,
 }
 
 impl Lyrics {
     pub fn new() -> Self {
-        let (tx, requests) = channel::<(String, String, Option<f64>)>();
+        let (tx, requests) = channel::<LyricRequest>();
         let (answers, rx) = channel();
         thread::spawn(move || {
             let mut cache = HashMap::<String, LyricState>::new();
-            while let Ok((title, artist, duration)) = requests.recv() {
-                let key = track_key(&title, &artist);
+            while let Ok(request) = requests.recv() {
+                let key = track_key(&request.title, &request.artist);
                 let cache_key = format!(
-                    "{key}\0{}",
-                    duration
+                    "{key}\0{}\0{}",
+                    request
+                        .duration
                         .map(|seconds| format!("{seconds:.0}"))
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
+                    u8::from(request.online_lrclib),
                 );
-                let state = cache
-                    .entry(cache_key)
-                    .or_insert_with(|| lookup(&title, &artist, duration));
+                let state = cache.entry(cache_key).or_insert_with(|| {
+                    lookup_with_policy(
+                        &request.title,
+                        &request.artist,
+                        request.duration,
+                        request.online_lrclib,
+                    )
+                });
                 if answers.send((key, state.clone())).is_err() {
                     break;
                 }
@@ -57,7 +75,30 @@ impl Lyrics {
             rx,
             key: String::new(),
             state: LyricState::Unavailable,
+            raw_title: String::new(),
+            raw_artist: String::new(),
             duration: None,
+            enabled: true,
+            online_lrclib: true,
+        }
+    }
+
+    pub fn set_config(&mut self, enabled: bool, online_lrclib: bool) {
+        let changed = self.enabled != enabled || self.online_lrclib != online_lrclib;
+        self.enabled = enabled;
+        self.online_lrclib = online_lrclib;
+        if !enabled {
+            self.state = LyricState::Unavailable;
+            return;
+        }
+        if changed && !self.raw_title.is_empty() {
+            self.state = LyricState::Loading;
+            let _ = self.tx.send(LyricRequest {
+                title: self.raw_title.clone(),
+                artist: self.raw_artist.clone(),
+                duration: self.duration,
+                online_lrclib: self.online_lrclib,
+            });
         }
     }
 
@@ -67,37 +108,45 @@ impl Lyrics {
             return;
         }
         self.key = key;
+        self.raw_title = title.to_owned();
+        self.raw_artist = artist.to_owned();
         self.duration = duration;
-        if title.is_empty() {
+        if title.is_empty() || !self.enabled {
             self.state = LyricState::Unavailable;
         } else {
             self.state = LyricState::Loading;
-            let _ = self
-                .tx
-                .send((title.to_owned(), artist.to_owned(), duration));
+            let _ = self.tx.send(LyricRequest {
+                title: title.to_owned(),
+                artist: artist.to_owned(),
+                duration,
+                online_lrclib: self.online_lrclib,
+            });
         }
     }
 
     pub fn poll(&mut self) {
         while let Ok((key, state)) = self.rx.try_recv() {
-            if key == self.key {
+            if self.enabled && key == self.key {
                 self.state = state;
             }
         }
     }
 
     pub fn update_duration(&mut self, duration: Option<f64>) {
-        if self.duration == duration || self.key.is_empty() || self.key == track_key("", "") {
+        if self.duration == duration || self.raw_title.is_empty() {
             return;
         }
         self.duration = duration;
-        let Some((title, artist)) = self.key.split_once('\0') else {
+        if !self.enabled {
             return;
-        };
+        }
         self.state = LyricState::Loading;
-        let _ = self
-            .tx
-            .send((title.to_owned(), artist.to_owned(), duration));
+        let _ = self.tx.send(LyricRequest {
+            title: self.raw_title.clone(),
+            artist: self.raw_artist.clone(),
+            duration,
+            online_lrclib: self.online_lrclib,
+        });
     }
 
     pub fn synced(&self) -> Option<&[Line]> {
@@ -260,7 +309,17 @@ fn choose_candidate(
         })
 }
 
+#[allow(dead_code)]
 fn lookup(title: &str, artist: &str, duration: Option<f64>) -> LyricState {
+    lookup_with_policy(title, artist, duration, true)
+}
+
+fn lookup_with_policy(
+    title: &str,
+    artist: &str,
+    duration: Option<f64>,
+    online_lrclib: bool,
+) -> LyricState {
     for path in local_path(title, artist) {
         if let Ok(raw) = std::fs::read_to_string(path) {
             let lines = parse_lrc(&raw);
@@ -271,6 +330,9 @@ fn lookup(title: &str, artist: &str, duration: Option<f64>) -> LyricState {
                 return LyricState::Plain(raw);
             }
         }
+    }
+    if !online_lrclib {
+        return LyricState::Unavailable;
     }
     let url = format!(
         "https://lrclib.net/api/search?track_name={}&artist_name={}",
