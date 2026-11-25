@@ -4,7 +4,7 @@
   <p>A Linux/X11 top-center notch overlay built in Rust with eframe/egui and MPRIS over D-Bus.</p>
 </div>
 
-GlacierNotch sits at the top center of an X11 desktop above the XFCE panel. The window stays at a fixed size while only the painted pill animates on hover, and its X11 input shape passes clicks through the transparent area when collapsed. Inspired by Max's macOS [Gliese](https://github.com/Rymaxw/Gliese), built from scratch as a native Linux application.
+GlacierNotch sits at the top center of an X11 desktop above the XFCE panel. The window stays at a fixed size while only the painted pill animates on hover, and its X11 input shape passes clicks through the transparent area when collapsed.
 
 ## Features
 
