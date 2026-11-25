@@ -381,8 +381,12 @@ impl eframe::App for Glacier {
                 self.playback_clock.observe(&track, Instant::now());
                 self.track = track;
             }
-            self.lyrics
-                .update_track(&self.track.title, &self.track.artist, self.track.length);
+            self.lyrics.update_track(
+                &self.track.title,
+                &self.track.artist,
+                &self.track.album,
+                self.track.length,
+            );
             self.lyrics.update_duration(self.track.length);
             self.lyrics.poll();
             self.artwork.update(&ctx, self.track.art_url.as_deref());

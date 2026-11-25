@@ -381,15 +381,10 @@ fn read_player(conn: &Connection, dest: &str) -> Result<Track, Box<dyn std::erro
 
     if let Ok(meta) = player.get_property::<HashMap<String, OwnedValue>>("Metadata") {
         track.title = text(meta.get("xesam:title")).unwrap_or_default();
-        track.artist = list(meta.get("xesam:artist")).unwrap_or_default();
+        track.artist = extract_artist(&meta);
         track.album = text(meta.get("xesam:album")).unwrap_or_default();
         track.art_url = text(meta.get("mpris:artUrl"));
-        if let Some(len) = meta
-            .get("mpris:length")
-            .and_then(|v| v.downcast_ref::<i64>().ok())
-        {
-            track.length = Some(len as f64 / 1e6);
-        }
+        track.length = extract_length(meta.get("mpris:length"));
         track.track_id = meta
             .get("mpris:trackid")
             .and_then(|v| ObjectPath::try_from(v.try_clone().ok()?).ok())
@@ -406,9 +401,42 @@ fn text(value: Option<&OwnedValue>) -> Option<String> {
 }
 
 fn list(value: Option<&OwnedValue>) -> Option<String> {
-    let parts = value.and_then(|v| Vec::<String>::try_from(v.try_clone().ok()?).ok())?;
-    let joined = parts.join(", ");
-    (!joined.is_empty()).then_some(joined)
+    if let Some(parts) = value.and_then(|v| Vec::<String>::try_from(v.try_clone().ok()?).ok()) {
+        let joined = parts
+            .into_iter()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !joined.is_empty() {
+            return Some(joined);
+        }
+    }
+    text(value)
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+fn extract_artist(meta: &HashMap<String, OwnedValue>) -> String {
+    list(meta.get("xesam:artist"))
+        .or_else(|| list(meta.get("xesam:albumArtist")))
+        .unwrap_or_default()
+}
+
+fn extract_length(value: Option<&OwnedValue>) -> Option<f64> {
+    let value = value?;
+    let micros = if let Ok(len) = value.downcast_ref::<i64>() {
+        (len > 0).then_some(len as f64)
+    } else if let Ok(len) = value.downcast_ref::<u64>() {
+        (len > 0).then_some(len as f64)
+    } else if let Ok(len) = value.downcast_ref::<i32>() {
+        (len > 0).then_some(len as f64)
+    } else if let Ok(len) = value.downcast_ref::<u32>() {
+        (len > 0).then_some(len as f64)
+    } else {
+        None
+    }?;
+    Some(micros / 1e6)
 }
 
 /// Seek target clamped to the track, so a click near the edges cannot land on
@@ -591,6 +619,70 @@ mod tests {
         clock.jump_to(70.0, start);
         assert!((clock.position(start) - 70.0).abs() < 0.001);
         assert!((clock.position(start + Duration::from_secs(2)) - 72.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn artist_extraction_handles_scalar_and_album_artist_fallback() {
+        let mut meta = HashMap::new();
+        meta.insert(
+            "xesam:artist".to_owned(),
+            OwnedValue::try_from(zbus::zvariant::Value::from("Solo Artist")).unwrap(),
+        );
+        assert_eq!(extract_artist(&meta), "Solo Artist");
+
+        meta.insert(
+            "xesam:artist".to_owned(),
+            OwnedValue::try_from(zbus::zvariant::Value::from(vec![
+                "Artist A".to_owned(),
+                "Artist B".to_owned(),
+            ]))
+            .unwrap(),
+        );
+        assert_eq!(extract_artist(&meta), "Artist A, Artist B");
+
+        meta.insert(
+            "xesam:artist".to_owned(),
+            OwnedValue::try_from(zbus::zvariant::Value::from(Vec::<String>::new())).unwrap(),
+        );
+        meta.insert(
+            "xesam:albumArtist".to_owned(),
+            OwnedValue::try_from(zbus::zvariant::Value::from(vec!["Album Artist".to_owned()]))
+                .unwrap(),
+        );
+        assert_eq!(extract_artist(&meta), "Album Artist");
+
+        meta.remove("xesam:artist");
+        meta.insert(
+            "xesam:albumArtist".to_owned(),
+            OwnedValue::try_from(zbus::zvariant::Value::from("Scalar Album Artist")).unwrap(),
+        );
+        assert_eq!(extract_artist(&meta), "Scalar Album Artist");
+    }
+
+    #[test]
+    fn length_extraction_handles_integer_types_and_non_positive_values() {
+        assert_eq!(
+            extract_length(Some(&OwnedValue::from(180_000_000_i64))),
+            Some(180.0)
+        );
+        assert_eq!(
+            extract_length(Some(&OwnedValue::from(215_500_000_u64))),
+            Some(215.5)
+        );
+        assert_eq!(
+            extract_length(Some(&OwnedValue::from(120_000_000_i32))),
+            Some(120.0)
+        );
+        assert_eq!(
+            extract_length(Some(&OwnedValue::from(90_000_000_u32))),
+            Some(90.0)
+        );
+        assert_eq!(extract_length(Some(&OwnedValue::from(0_i64))), None);
+        assert_eq!(extract_length(Some(&OwnedValue::from(-10_000_i64))), None);
+        assert_eq!(extract_length(Some(&OwnedValue::from(0_u64))), None);
+        assert_eq!(extract_length(Some(&OwnedValue::from(0_i32))), None);
+        assert_eq!(extract_length(Some(&OwnedValue::from(0_u32))), None);
+        assert_eq!(extract_length(None), None);
     }
 
     #[test]
